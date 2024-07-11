@@ -2229,26 +2229,28 @@ static int hyper_vsm_validate_access(CPUState *cs, uint8_t flags, uint64_t gpa,
     return HV_XLATE_GVA_SUCCESS;
 }
 
-static bool kvm_gva_to_gpa(CPUState *cs, uint64_t gva, uint64_t *gpa,
-                           size_t *len, bool is_write)
+#define INVALID_GPA	(~(uint64_t)0)
+static uint64_t kvm_gva_to_gpa(CPUState *cs, uint64_t gva, size_t *len, MemFaultAttrs *access)
 {
-        struct kvm_translation tr = {
+    struct kvm_translation tr = {
             .linear_address = gva,
-        };
+    };
 
-        if (len) {
-            *len = TARGET_PAGE_SIZE - (gva & ~TARGET_PAGE_MASK);
-        }
+    if (len) {
+        *len = TARGET_PAGE_SIZE - (gva & ~TARGET_PAGE_MASK);
+    }
 
-        if (kvm_vcpu_ioctl(cs, KVM_TRANSLATE, &tr) || !tr.valid ||
-            (is_write && !tr.writeable)) {
-            return false;
-        }
-        *gpa = tr.physical_address;
-        return true;
+    if (kvm_vcpu_ioctl(cs, KVM_TRANSLATE, &tr) || !tr.valid) {
+        return INVALID_GPA;
+    }
+
+    access->write = tr.writeable;
+    access->exec = true;
+    access->user = tr.usermode;
+    return tr.physical_address;
 }
 
-#define INVALID_GPA	(~(uint64_t)0)
+
 uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_exit *exit)
 {
     bool fast = exit->u.hcall.input & HV_HYPERCALL_FAST;
@@ -2257,8 +2259,6 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
 	uint8_t flags, target_vtl;
     CPUState *target_vcpu;
     MemFaultAttrs access;
-    MemTxAttrs attrs;
-    uint64_t alt_gpa = INVALID_GPA;
 
     if (fast) {
         input.partition_id = exit->u.hcall.ingpa;
@@ -2291,15 +2291,7 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
         return HV_STATUS_INVALID_VP_INDEX;
     }
 
-	output.gpa = cpu_get_phys_page_attrs_debug(target_vcpu, input.gva << HV_PAGE_SHIFT,
-                                               &attrs, &access);
-
-    kvm_gva_to_gpa(target_vcpu, input.gva << HV_PAGE_SHIFT, &alt_gpa, NULL,
-                   flags & HV_XLATE_GVA_VAL_WRITE);
-
-    if (output.gpa != alt_gpa)
-        printf("Translation for %lx had different results %lx vs %lx\n",
-                input.gva << HV_PAGE_SHIFT, output.gpa, alt_gpa);
+    output.gpa = kvm_gva_to_gpa(target_vcpu, input.gva << HV_PAGE_SHIFT, NULL, &access);
 
     if (output.gpa == INVALID_GPA) {
 		output.result_code = HV_XLATE_GVA_UNMAPPED;
