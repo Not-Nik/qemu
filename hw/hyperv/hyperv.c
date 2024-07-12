@@ -2176,13 +2176,6 @@ static uint64_t hyperv_translate_va_validate_input(CPUState *cs,
 
     in_vtl.as_uint8 = in->control_flags >> 56;
     *flags = in->control_flags & HV_XLATE_GVA_FLAGS_MASK;
-    if (*flags > (HV_XLATE_GVA_VAL_READ | HV_XLATE_GVA_VAL_WRITE |
-                  HV_XLATE_GVA_VAL_EXECUTE))
-        printf("Translate VA control flags unsupported and will be "
-               "ignored: 0x%lx\n", in->control_flags);
-
-    if (!(*flags & HV_XLATE_GVA_PRIVILEGE_EXEMPT))
-        printf("translate without privilege\n");
 
     if (in_vtl.use_target_vtl) {
         *target_vtl = in_vtl.target_vtl;
@@ -2211,45 +2204,34 @@ static bool hyperv_gpa_is_overlay(CPUState *cs, uint64_t gpa)
     return false;
 }
 
-static int hyper_vsm_validate_access(CPUState *cs, uint8_t flags, uint64_t gpa,
-                                     MemFaultAttrs *access)
+static struct kvm_translation2 kvm_gva_to_gpa(CPUState *cs, uint64_t gva, size_t *len, uint64_t control_flags)
 {
-    if (((flags & HV_XLATE_GVA_VAL_WRITE) && !access->write) ||
-        ((flags & HV_XLATE_GVA_VAL_EXECUTE) && !access->exec))
-        return HV_XLATE_GVA_PRIVILEGE_VIOLATION;
+    int aw = (control_flags & HV_XLATE_GVA_VAL_WRITE) ? KVM_TRANSLATE_ACCESS_WRITE : 0;
+    int ae = (control_flags & HV_XLATE_GVA_VAL_EXECUTE) ? KVM_TRANSLATE_ACCESS_EXEC : 0;
+    int au = (!(control_flags & HV_XLATE_GVA_PRIVILEGE_EXEMPT) && (X86_CPU(cs)->env.hflags & HF_CPL_MASK))
+             ? KVM_TRANSLATE_ACCESS_USER : 0;
 
-    if ((flags & HV_XLATE_GVA_VAL_READ) &&
-        !address_space_access_valid(cs->as, gpa, HV_PAGE_SIZE, false, MEMTXATTRS_UNSPECIFIED))
-        return HV_XLATE_GPA_NO_READ;
+    int flags = control_flags & HV_XLATE_GVA_SET_PAGE_TABLE_BITS ? KVM_TRANSLATE_FLAGS_SET_ACCESSED |
+                                                                   KVM_TRANSLATE_FLAGS_FORCE_SET_ACCESSED |
+                                                                   (aw ? KVM_TRANSLATE_FLAGS_SET_DIRTY : 0) : 0;
 
-    if ((flags & HV_XLATE_GVA_VAL_WRITE) &&
-        !address_space_access_valid(cs->as, gpa, HV_PAGE_SIZE, true, MEMTXATTRS_UNSPECIFIED))
-        return HV_XLATE_GPA_NO_WRITE;
-
-    return HV_XLATE_GVA_SUCCESS;
-}
-
-#define INVALID_GPA	(~(uint64_t)0)
-static uint64_t kvm_gva_to_gpa(CPUState *cs, uint64_t gva, size_t *len, MemFaultAttrs *access)
-{
-    struct kvm_translation tr = {
-            .linear_address = gva,
+    struct kvm_translation2 tr = {
+        .linear_address = gva,
+            .flags = flags,
+            .access = aw | ae | au
     };
 
     if (len) {
         *len = TARGET_PAGE_SIZE - (gva & ~TARGET_PAGE_MASK);
     }
 
-    if (kvm_vcpu_ioctl(cs, KVM_TRANSLATE, &tr) || !tr.valid) {
-        return INVALID_GPA;
+    if (kvm_vcpu_ioctl(cs, KVM_TRANSLATE2, &tr)) {
+        warn_report("KVM_TRANSLATE2 failed");
+        tr.valid = false;
     }
 
-    access->write = tr.writeable;
-    access->exec = true;
-    access->user = tr.usermode;
-    return tr.physical_address;
+    return tr;
 }
-
 
 uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_exit *exit)
 {
@@ -2258,7 +2240,7 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
 	struct hv_xlate_va_input input;
 	uint8_t flags, target_vtl;
     CPUState *target_vcpu;
-    MemFaultAttrs access;
+    struct kvm_translation2 tr;
 
     if (fast) {
         input.partition_id = exit->u.hcall.ingpa;
@@ -2291,16 +2273,30 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
         return HV_STATUS_INVALID_VP_INDEX;
     }
 
-    output.gpa = kvm_gva_to_gpa(target_vcpu, input.gva << HV_PAGE_SHIFT, NULL, &access);
+    tr = kvm_gva_to_gpa(target_vcpu, input.gva << HV_PAGE_SHIFT, NULL, input.control_flags);
 
-    if (output.gpa == INVALID_GPA) {
-		output.result_code = HV_XLATE_GVA_UNMAPPED;
-	} else {
-        output.result_code = hyper_vsm_validate_access(target_vcpu, flags, output.gpa, &access);
-		output.cache_type = HV_CACHE_TYPE_X64_WB;
-        output.overlay_page = hyperv_gpa_is_overlay(target_vcpu, output.gpa);
-        output.gpa >>= HV_PAGE_SHIFT;
-	}
+    output.gpa = tr.physical_address >> HV_PAGE_SHIFT;
+
+    if (tr.valid) {
+        output.result_code = HV_XLATE_GVA_SUCCESS;
+        output.cache_type = HV_CACHE_TYPE_X64_WB;
+        output.overlay_page = hyperv_gpa_is_overlay(target_vcpu, tr.physical_address);
+    } else {
+        if (tr.error_code == KVM_TRANSLATE_FAULT_NOT_PRESENT || tr.error_code == KVM_TRANSLATE_FAULT_INVALID_GVA) {
+            output.result_code = HV_XLATE_GVA_UNMAPPED;
+        } else if (tr.error_code == KVM_TRANSLATE_FAULT_PRIVILEGE_VIOLATION) {
+            output.result_code = HV_XLATE_GVA_PRIVILEGE_VIOLATION;
+        } else if (tr.error_code == KVM_TRANSLATE_FAULT_RESERVED_BITS) {
+            output.result_code = HV_XLATE_GVA_INVALID_PAGE_TABLE_FLAGS;
+        } else if (tr.error_code == KVM_TRANSLATE_FAULT_INVALID_GPA) {
+            output.result_code = HV_XLATE_GPA_UNMAPPED;
+        } else if (!tr.set_bits_succeeded && input.control_flags & HV_XLATE_GVA_SET_PAGE_TABLE_BITS) {
+            output.result_code = HV_XLATE_GPA_NO_WRITE;
+        } else {
+            warn_report("unknown translate error code %u", tr.error_code);
+            output.result_code = HV_XLATE_GVA_PRIVILEGE_VIOLATION;
+        }
+    }
 
 	trace_hyperv_hcall_translate_virtual_address(input.partition_id, input.vp_index,
                                                  target_vtl, input.control_flags,
