@@ -2165,33 +2165,34 @@ uint64_t hyperv_hcall_get_set_vp_register(CPUState *cs, struct kvm_hyperv_exit *
     return (uint64_t)HV_STATUS_SUCCESS | ((uint64_t)nregs << HV_HYPERCALL_REP_COMP_OFFSET);
 }
 
-static bool hyperv_translate_va_validate_input(CPUState *cs,
+static uint64_t hyperv_translate_va_validate_input(CPUState *cs,
                                            struct hv_xlate_va_input *in,
-                                           uint8_t *vtl, uint8_t *flags)
+                                           uint8_t *target_vtl, uint8_t *flags)
 {
-  union hv_input_vtl in_vtl;
+    union hv_input_vtl in_vtl;
 
     if (in->partition_id != HV_PARTITION_ID_SELF)
-        return false;
-
-    if (in->vp_index != HV_VP_INDEX_SELF && in->vp_index != hyperv_vp_index(cs))
-        return false;
+        return HV_STATUS_INVALID_PARTITION_ID;
 
     in_vtl.as_uint8 = in->control_flags >> 56;
     *flags = in->control_flags & HV_XLATE_GVA_FLAGS_MASK;
     if (*flags > (HV_XLATE_GVA_VAL_READ | HV_XLATE_GVA_VAL_WRITE |
                   HV_XLATE_GVA_VAL_EXECUTE))
-      printf("Translate VA control flags unsupported and will be "
-             "ignored: 0x%lx\n", in->control_flags);
+        printf("Translate VA control flags unsupported and will be "
+               "ignored: 0x%lx\n", in->control_flags);
 
     if (!(*flags & HV_XLATE_GVA_PRIVILEGE_EXEMPT))
         printf("translate without privilege\n");
 
-    *vtl = in_vtl.use_target_vtl ? in_vtl.target_vtl : get_active_vtl(cs);
-    if (*vtl > get_active_vtl(cs))
-        return false;
+    if (in_vtl.use_target_vtl) {
+        *target_vtl = in_vtl.target_vtl;
+        if (*target_vtl > get_active_vtl(cs))
+            return HV_STATUS_INVALID_VP_STATE;
+    } else {
+        *target_vtl = get_active_vtl(cs);
+    }
 
-    return true;
+    return HV_STATUS_SUCCESS;
 }
 
 static bool hyperv_gpa_is_overlay(CPUState *cs, uint64_t gpa)
@@ -2259,18 +2260,19 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
     MemTxAttrs attrs;
     uint64_t alt_gpa = INVALID_GPA;
 
-	if (fast) {
+    if (fast) {
         input.partition_id = exit->u.hcall.ingpa;
         input.vp_index = exit->u.hcall.outgpa & 0xFFFFFFFF;
-		input.control_flags = exit->u.hcall.xmm[0];
-		input.gva = exit->u.hcall.xmm[1];
-	} else {
-		hyperv_physmem_read(cs, exit->u.hcall.ingpa, &input, sizeof(input));
+        input.control_flags = exit->u.hcall.xmm[0];
+        input.gva = exit->u.hcall.xmm[1];
+    } else {
+        hyperv_physmem_read(cs, exit->u.hcall.ingpa, &input, sizeof(input));
     }
 
-	if (!hyperv_translate_va_validate_input(cs, &input, &target_vtl, &flags)) {
-        printf("Failed to parse tx va\n");
-		return HV_STATUS_INVALID_HYPERCALL_INPUT;
+    uint64_t input_validity = hyperv_translate_va_validate_input(cs, &input, &target_vtl, &flags);
+    if (input_validity != HV_STATUS_SUCCESS) {
+        printf("Input is invalid\n");
+        return input_validity;
     }
 
     // All VPs
