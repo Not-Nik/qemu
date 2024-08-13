@@ -2273,7 +2273,22 @@ uint64_t hyperv_hcall_translate_virtual_address(CPUState *cs, struct kvm_hyperv_
 		return HV_STATUS_INVALID_HYPERCALL_INPUT;
     }
 
-	target_vcpu = hyperv_vsm_vcpu(hyperv_vp_index(cs), target_vtl);
+    // All VPs
+    if (input.vp_index == HV_ANY_VP) {
+        return HV_STATUS_INVALID_VP_INDEX;
+    }
+
+    if (input.vp_index == HV_VP_INDEX_SELF) {
+        target_vcpu = hyperv_vsm_vcpu(hyperv_vp_index(cs), target_vtl);
+    } else {
+        target_vcpu = hyperv_vsm_vcpu(input.vp_index, target_vtl);
+    }
+
+    if (!target_vcpu) {
+        printf("Invalid VP index %i\n", input.vp_index);
+        return HV_STATUS_INVALID_VP_INDEX;
+    }
+
 	output.gpa = cpu_get_phys_page_attrs_debug(target_vcpu, input.gva << HV_PAGE_SHIFT,
                                                &attrs, &access);
 

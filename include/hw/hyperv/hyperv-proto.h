@@ -13,6 +13,8 @@
 #include "qemu/bitmap.h"
 
 #define HV_PARTITION_ID_SELF		((uint64_t)-1)
+
+#define HV_ANY_VP                   ((uint32_t)-1)
 #define HV_VP_INDEX_SELF		    ((uint32_t)-2)
 
 //TODO: 16?
