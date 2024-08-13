@@ -2420,12 +2420,13 @@ static int hyperv_set_memory_attrs(uint8_t vtl, uint32_t flags, uint16_t count,
     uint64_t start, end;
     int i, ret;
 
-    start = gfn_list[0];
-    end = start + 1;
-    for (i = 1; i < count; i++) {
-        if (gfn_list[i] == end) {
+    for (i = 0; i < count; i++) {
+        start = gfn_list[i];
+        end = start + 1;
+
+        while (i+1 < count && gfn_list[i+1] == end) {
             end++;
-            continue;
+            i++;
         }
 
         attrs.address = start << HV_PAGE_SHIFT;
@@ -2438,20 +2439,6 @@ static int hyperv_set_memory_attrs(uint8_t vtl, uint32_t flags, uint16_t count,
                  attrs.address, attrs.size, attrs.attributes, ret);
             return ret;
         }
-
-        start = gfn_list[i];
-        end = start + 1;
-    }
-
-    attrs.address = start << HV_PAGE_SHIFT;
-    attrs.size = (end - start) * HV_PAGE_SIZE;
-    attrs.attributes = hyperv_memprot_flags_to_memattrs(flags);
-
-    ret = kvm_vm_ioctl(s, KVM_SET_MEMORY_ATTRIBUTES, &attrs);
-    if (ret) {
-        printf("Failed to set memprots for: addr %llx, size %llx, attrs 0x%llx\n",
-             attrs.address, attrs.size, attrs.attributes);
-        return ret;
     }
 
     for (i = 0; i < count; i++)
